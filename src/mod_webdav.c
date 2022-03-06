@@ -491,6 +491,7 @@ __attribute_cold__
 static int mod_webdav_sqlite3_init (const char * restrict s, log_error_st *errh);
 
 SETDEFAULTS_FUNC(mod_webdav_set_defaults) {
+
     static const config_plugin_keys_t cpk[] = {
       { CONST_STR_LEN("webdav.sqlite-db-name"),
         T_CONFIG_STRING,

@@ -58,6 +58,7 @@ static int mod_alias_check_order(server * const srv, const array * const a) {
             if (buffer_clen(key) < plen) {
                 break;
             }
+
             if (memcmp(key->ptr, prefix->ptr, plen) != 0) {
                 break;
             }
