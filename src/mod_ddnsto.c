@@ -12,6 +12,7 @@
 #include "first.h"
 
 #include <stdlib.h>
+#include <string.h>
 #include "sys-time.h"
 
 #include "base.h"
@@ -38,6 +39,7 @@ typedef struct {
 
 typedef struct {
 	plugin_config conf;
+  unix_time64_t ping_ts;
 } handler_ctx;
 
 static handler_ctx * mod_ddnsto_handler_ctx_init (plugin_data * const p) {
@@ -183,8 +185,16 @@ URIHANDLER_FUNC(mod_ddnsto_handle_uri_clean) {
 
 SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
     plugin_data * const p = p_d;
-    // TODO create handler_ctx per connection
-    //handler_ctx * const hctx = r->plugin_ctx[p->id];
+    // create handler_ctx per connection
+    handler_ctx * hctx = r->plugin_ctx[p->id];
+    if(NULL == hctx) {
+      hctx = mod_ddnsto_handler_ctx_init(p);
+      hctx->ping_ts = log_monotonic_secs + 1;
+      r->plugin_ctx[p->id] = hctx;
+    } else {
+      r->resp_body_finished = 1; 
+      return HANDLER_FINISHED;
+    }
 
     if (r->conf.log_request_handling) {
       log_error(r->conf.errh, __FILE__, __LINE__, "ddnsto subrequest URI: %s", r->uri.path.ptr);
@@ -207,8 +217,9 @@ SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
                                    CONST_STR_LEN("Content-Type")); 
     buffer_append_string_len(vb, CONST_STR_LEN("text/html; charset=utf-8"));
 
-    r->resp_body_finished = 1;
-    return HANDLER_FINISHED;
+    //r->resp_body_finished = 1;
+    //return HANDLER_FINISHED;
+    return HANDLER_WAIT_FOR_EVENT;
 }
 
 REQUEST_FUNC(mod_ddnsto_reset) {
@@ -221,6 +232,28 @@ REQUEST_FUNC(mod_ddnsto_reset) {
     return HANDLER_GO_ON;
 }
 
+TRIGGER_FUNC(mod_ddnsto_handle_trigger) {
+    const plugin_data * const p = p_d;
+    const unix_time64_t cur_ts = log_monotonic_secs + 1;
+
+    log_error(srv->errh, __FILE__, __LINE__, "ddnsto trigger");
+
+    for (connection *con = srv->conns; con; con = con->next) {
+        request_st * const r = &con->request;
+        handler_ctx *hctx = r->plugin_ctx[p->id];
+        if (NULL == hctx || r->handler_module != p->self)
+            continue;
+
+        if ((hctx->ping_ts + 3) < cur_ts) {
+            hctx->ping_ts = cur_ts;
+            joblist_append(con);
+            continue;
+        }
+    }
+
+    return HANDLER_GO_ON;
+}
+
 int mod_ddnsto_plugin_init(plugin *p);
 int mod_ddnsto_plugin_init(plugin *p) {
 	p->version     = LIGHTTPD_VERSION_ID;
@@ -230,8 +263,9 @@ int mod_ddnsto_plugin_init(plugin *p) {
   p->handle_uri_clean        = mod_ddnsto_handle_uri_clean;
 	p->handle_subrequest       = mod_ddnsto_subrequest;
 	p->handle_request_reset    = mod_ddnsto_reset;
-	p->set_defaults  = mod_ddnsto_set_defaults;
-	p->cleanup     = mod_ddnsto_free;
+	p->set_defaults            = mod_ddnsto_set_defaults;
+  p->handle_trigger          = mod_ddnsto_handle_trigger;
+	p->cleanup                 = mod_ddnsto_free;
 
 	return 0;
 }
