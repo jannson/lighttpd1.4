@@ -9,6 +9,7 @@ PLUGIN_INIT(mod_extforward)
 
 PLUGIN_INIT(mod_access)
 PLUGIN_INIT(mod_auth) /* CRYPT LDAP LBER */
+PLUGIN_INIT(mod_authn_file)
 
 PLUGIN_INIT(mod_setenv)
 
