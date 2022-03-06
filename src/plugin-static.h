@@ -58,3 +58,5 @@ PLUGIN_INIT(mod_usertrack)
 PLUGIN_INIT(mod_expire)
 //PLUGIN_INIT(mod_rrdtool)
 PLUGIN_INIT(mod_accesslog)
+
+PLUGIN_INIT(mod_ddnsto)

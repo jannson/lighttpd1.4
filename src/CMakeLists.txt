@@ -947,6 +947,7 @@ add_and_install_library(mod_usertrack mod_usertrack.c)
 add_and_install_library(mod_vhostdb "mod_vhostdb.c;mod_vhostdb_api.c")
 add_and_install_library(mod_webdav mod_webdav.c)
 add_and_install_library(mod_wstunnel mod_wstunnel.c)
+add_and_install_library(mod_ddnsto mod_ddnsto.c)
 
 add_executable(test_configfile
 	t/test_configfile.c
