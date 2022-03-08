@@ -205,7 +205,7 @@ char *kstrnstr(const char *str, const char *pat, int n, int **_prep)
 }
 
 int kstrcasecmp(kstring_t * str, const char *s2) {
-    int n = strlen(s2);
+    size_t n = strlen(s2);
     if(n > ks_len(str)) {
         return 1;
     } else if(n < ks_len(str)) {

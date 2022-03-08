@@ -30,18 +30,20 @@
 
 #include "plugin.h"
 
-#define COMMAND_TAG_LEN 32
-#define COMMAND_DEF 50
-#define COMMAND_MAX 200
+#define CONN_TIMEOUT    (30)
+#define COMMAND_TIMEOUT (20)
+#define COMMAND_TAG_LEN (32)
+#define COMMAND_DEF     (50)
+#define COMMAND_MAX     (200)
 typedef struct command {
   uint32_t        local_id;
   uint32_t        remote_id;
   char            remote_tag[COMMAND_TAG_LEN];
-  unix_time64_t   create_ts;
+  time_t          create_ts;
   kstring_t       val;
 } command_t;
 
-typedef struct ddnsto_command* command_item;
+typedef struct command* command_item;
 typedef kvec_t(command_item) command_array;
 
 typedef struct {
@@ -55,10 +57,13 @@ typedef struct handler_conn {
 
   STAILQ_ENTRY(handler_conn) conn_entry;
 
-  int command_ready;
-  int command_from;
-  int command_size;
-  unix_time64_t create_ts;
+  int      command_ready;
+  uint32_t command_from;
+  uint32_t command_size;
+  int      conn_add;
+  time_t   create_ts;
+
+  request_st* r;
 } handler_conn_ctx;
 
 STAILQ_HEAD(handler_conn_list_head, handler_conn);
@@ -80,46 +85,12 @@ static handler_conn_ctx * mod_ddnsto_handler_ctx_init (plugin_data * const p) {
     return hctx;
 }
 
-static void mod_ddnsto_handler_ctx_free (handler_conn_ctx *hctx) {
+static void mod_ddnsto_handler_ctx_free(plugin_data * const p, handler_conn_ctx *hctx) {
+    if(hctx->conn_add) {
+      STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
+      hctx->conn_add = 0;
+    }
     free(hctx);
-}
-
-static handler_t mod_echo_request_body(request_st * const r) {
-    chunkqueue * const cq = &r->reqbody_queue;
-    chunkqueue_remove_finished_chunks(cq); /* unnecessary? */
-    off_t cqlen = chunkqueue_length(cq);
-    if ((r->conf.stream_response_body & FDEVENT_STREAM_RESPONSE_BUFMIN)
-        && r->resp_body_started) {
-        if (chunkqueue_length(&r->write_queue) > 65536 - 4096) {
-            /* wait for more data to be sent to client */
-            return HANDLER_WAIT_FOR_EVENT;
-        }
-        else {
-            if (cqlen > 65536) {
-                cqlen = 65536;
-                joblist_append(r->con);
-            }
-        }
-    }
-
-    if (0 != http_chunk_transfer_cqlen(r, cq, (size_t)cqlen))
-        return HANDLER_ERROR;
-
-    if (cq->bytes_out == (off_t)r->reqbody_length) {
-        /* sent all request body input */
-        http_response_backend_done(r);
-        return HANDLER_FINISHED;
-    }
-
-    cqlen = chunkqueue_length(cq);
-    if (cq->bytes_in != (off_t)r->reqbody_length && cqlen < 65536 - 16384) {
-        /*(r->conf.stream_request_body & FDEVENT_STREAM_REQUEST)*/
-        if (!(r->conf.stream_request_body & FDEVENT_STREAM_REQUEST_POLLIN)) {
-            r->conf.stream_request_body |= FDEVENT_STREAM_REQUEST_POLLIN;
-            r->con->is_readable = 1; /* trigger optimistic read from client */
-        }
-    }
-    return HANDLER_WAIT_FOR_EVENT;
 }
 
 static void mod_ddnsto_merge_config_cpv(plugin_config * const pconf, const config_plugin_value_t * const cpv) {
@@ -143,6 +114,11 @@ static void mod_ddnsto_patch_config(request_st * const r, plugin_data * const p)
         if (config_check_cond(r, (uint32_t)p->cvlist[i].k_id))
             mod_ddnsto_merge_config(&p->conf, p->cvlist + p->cvlist[i].v.u2[0]);
     }
+}
+
+static void http_status_set_error (request_st * const r, int status) {
+    r->resp_body_finished = 1;
+    r->http_status = status;
 }
 
 SETDEFAULTS_FUNC(mod_ddnsto_set_defaults) {
@@ -199,7 +175,7 @@ REQUEST_FUNC(mod_ddnsto_reset);
 URIHANDLER_FUNC(mod_ddnsto_handle_uri_clean) {
     plugin_data *p = p_d;
 
-    if (NULL == r->handler_module) {
+    if (NULL != r->handler_module) {
         return HANDLER_GO_ON;
     }
 
@@ -212,6 +188,176 @@ URIHANDLER_FUNC(mod_ddnsto_handle_uri_clean) {
     return HANDLER_GO_ON;
 }
 
+static command_t *create_command() {
+  return NULL;
+}
+
+static void free_command(command_t *cmd) {
+  ks_free(&cmd->val);
+  free(cmd);
+}
+
+static void remove_timeout_commands(plugin_data * const p, time_t now) {
+    now = now - COMMAND_TIMEOUT ;
+    if(kv_size(p->commands) > 0) {
+      command_t *cmd = NULL;
+      size_t i, j = 0;
+      for (i = 0; i < kv_size(p->commands); i++) {
+        cmd = kv_A(p->commands, i);
+        if(cmd->create_ts >= now) {
+          // not timeout
+          break;
+        }
+        free_command(cmd);
+        kv_A(p->commands, i) = NULL;
+      }
+      if (i > 0) {
+        for(; i < kv_size(p->commands); i++) {
+          kv_A(p->commands, j) = kv_A(p->commands, i);
+          j++;
+        }
+        kv_size(p->commands) = j;
+      }
+    }
+}
+
+static void response_json(request_st *r, const char* resp_str, size_t resp_len) {
+    chunkqueue * const cq = &r->write_queue;
+    buffer * const out = chunkqueue_append_buffer_open(cq);
+    buffer_append_string_len(out, resp_str, resp_len);
+    chunkqueue_append_buffer_commit(cq);
+
+    buffer * const vb = 
+      http_header_response_set_ptr(r, HTTP_HEADER_CONTENT_TYPE,
+                                   CONST_STR_LEN("Content-Type")); 
+    buffer_append_string_len(vb, CONST_STR_LEN("application/json; charset=utf-8"));
+}
+
+#define CMD_OUTPUT_FMT "{\"local_id\",%u, \"remote_id\":%u, \"remote_tag\":\"%s\", \"create_ts\":\"%llu\", \"get_ts\":\"%llu\", \"val\":\"%s\"}"
+
+static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
+    plugin_data * const p = p_d;
+    time_t now = time(NULL);
+    // create handler_conn_ctx per connection
+    handler_conn_ctx * hctx = r->plugin_ctx[p->id];
+    if(NULL == hctx) {
+      hctx = mod_ddnsto_handler_ctx_init(p);
+      hctx->create_ts = now;
+      r->plugin_ctx[p->id] = hctx;
+    } 
+    if(0 == hctx->command_ready) {
+      // not ready, read request
+      chunkqueue * const cq = &r->reqbody_queue;
+      chunkqueue_remove_finished_chunks(cq); /* unnecessary? */
+      if (cq->bytes_in < (off_t)r->reqbody_length) {
+        return HANDLER_WAIT_FOR_EVENT;
+      }
+
+      buffer *body = chunkqueue_read_squash(cq, r->conf.errh);
+      cJSON *json = NULL;
+      cJSON *tmp = NULL;
+      int ret = 0;
+      do {
+        json = cJSON_Parse(body->ptr);
+        if(NULL == json) {
+          ret = -1;
+          break;
+        }
+        tmp = cJSON_GetObjectItem(json, "from");
+        if(NULL == tmp) {
+          ret = -2;
+          break;
+        }
+        hctx->command_from = (uint32_t)tmp->valueint;
+        tmp = cJSON_GetObjectItem(json, "size");
+        if(NULL == tmp) {
+          hctx->command_size = COMMAND_DEF;
+        } else {
+          hctx->command_size = (uint32_t)tmp->valueint;
+          if(hctx->command_size > COMMAND_MAX) {
+            hctx->command_size = COMMAND_MAX;
+          }
+        }
+      } while(0);
+      if (NULL != json) {
+        cJSON_Delete(json);
+      }
+      chunk_buffer_release(body);
+      if(0 != ret) {
+        http_status_set_error(r, 400);
+        return HANDLER_FINISHED;
+      }
+      hctx->command_ready = 1;
+    }
+
+    remove_timeout_commands(p, now);
+
+    uint32_t output_size = 0;
+    kstring_t output = {0};
+    if(kv_size(p->commands) > 0) {
+      ksprintf(&output, "{\"success\":0,\"result\":[");
+      command_t *cmd = NULL;
+      for (size_t i = 0; i < kv_size(p->commands); i++) {
+        cmd = kv_A(p->commands, i);
+        if(cmd->local_id < hctx->command_from) {
+          continue;
+        }
+        char *fmt = CMD_OUTPUT_FMT ;
+        if(0 != output_size) {
+          fmt = ","CMD_OUTPUT_FMT ;
+        }
+        ksprintf(&output, fmt
+            , cmd->local_id
+            , cmd->remote_id
+            , cmd->remote_tag
+            , (uint64_t)cmd->create_ts
+            , (uint64_t)now
+            , ks_str(&cmd->val)
+            );
+        output_size++;
+        if(output_size >= hctx->command_size) {
+          break;
+        }
+      }
+      ksprintf(&output, "]}");
+    }
+    if(output_size > 0) {
+      if(hctx->conn_add) {
+        STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
+        hctx->conn_add = 0;
+      }
+      response_json(r, ks_str(&output), ks_len(&output));
+      r->resp_body_finished = 1; 
+      ks_free(&output);
+      return HANDLER_FINISHED;
+    }
+
+    // no new items, check timeout
+    if(hctx->create_ts < (now-COMMAND_TIMEOUT)) {
+      // timeout
+      if(hctx->conn_add) {
+        STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
+        hctx->conn_add = 0;
+      }
+      response_json(r, CONST_STR_LEN("{\"success\":-1001,\"error\":\"timeout\"}"));
+      r->resp_body_finished = 1; 
+      return HANDLER_FINISHED;
+    }
+
+    // not timeout, add to conns
+    if(0 == hctx->conn_add) {
+      // add to conn list
+      STAILQ_INSERT_TAIL(&p->handler_conn_list, hctx, conn_entry);
+      hctx->conn_add = 1;
+    }
+    hctx->r = r;
+    return HANDLER_WAIT_FOR_EVENT;
+}
+
+static handler_t handle_ddnsto_wake(request_st *r, void *p_d) {
+    return HANDLER_FINISHED;
+}
+
 SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
     plugin_data * const p = p_d;
 
@@ -220,75 +366,9 @@ SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
     }
 
     if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wait/"))) {
-        // create handler_conn_ctx per connection
-        handler_conn_ctx * hctx = r->plugin_ctx[p->id];
-        if(NULL == hctx) {
-          hctx = mod_ddnsto_handler_ctx_init(p);
-          hctx->create_ts = log_monotonic_secs + 1;
-          hctx->jb = chunk_buffer_acquire();
-          r->plugin_ctx[p->id] = hctx;
-        } 
-        if(0 == hctx->command_ready) {
-          // not ready, read request
-          chunkqueue * const cq = &r->reqbody_queue;
-          chunkqueue_remove_finished_chunks(cq); /* unnecessary? */
-          if (cq->bytes_in < (off_t)r->reqbody_length) {
-            return HANDLER_WAIT_FOR_EVENT;
-          }
-
-          buffer *body = chunkqueue_read_squash(cq, r->conf.errh);
-          cJSON *json = NULL;
-          cJSON *tmp = NULL;
-          int ret = 0;
-          do {
-            json = cJSON_Parse(body->ptr);
-            if(NULL == json) {
-              ret = -1;
-              break;
-            }
-            tmp = cJSON_GetObjectItem(json, "from");
-            if(NULL == tmp) {
-              ret = -2;
-              break;
-            }
-            hctx->command_from = tmp->valueint;
-            tmp = cJSON_GetObjectItem(json, "size");
-            if(NULL == tmp) {
-              hctx->command_size = COMMAND_DEF;
-            } else {
-              hctx->command_size = tmp->valueint;
-              if(hctx->command_size > COMMAND_MAX) {
-                hctx->command_size = COMMAND_MAX;
-              }
-            }
-          } while(0);
-          if (NULL != json) {
-            cJSON_Delete(json);
-          }
-          chunk_buffer_release(body);
-          if(0 != ret) {
-            http_status_set_error(r, 400);
-            return HANDLER_FINISHED;
-          }
-          hctx->command_ready = 1;
-        }
-
-        if(kv_size(p->commands) > 0) {
-          kstring_t output = {0};
-          ksprintf(&output, "{\"success\":0,\"result\":[");
-          command_t *cmd = NULL;
-          for (size_t i=0; i < kv_size(p->commands); i++) {
-            command_t *cmd = 
-            ksprintf(&output, "", )
-          }
-				  ksprintf(&output, "]}");
-        } else {
-          // check timeout
-        }
-
-        r->resp_body_finished = 1; 
-        return HANDLER_FINISHED;
+        return handle_ddnsto_wait(r, p_d);
     } else if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wake/"))) {
+        return handle_ddnsto_wake(r, p_d);
     } else {
       /* send error here */
         chunkqueue * const cq = &r->write_queue;
@@ -310,10 +390,11 @@ SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
 }
 
 REQUEST_FUNC(mod_ddnsto_reset) {
-    void ** const restrict dptr = &r->plugin_ctx[((plugin_data *)p_d)->id];
+    plugin_data * const p = p_d;
+    void ** const restrict dptr = &r->plugin_ctx[p->id];
     if (*dptr) {
-        --((plugin_data *)p_d)->processing;
-        mod_ddnsto_handler_ctx_free(*dptr);
+        --p->processing;
+        mod_ddnsto_handler_ctx_free(p, *dptr);
         *dptr = NULL;
     }
     return HANDLER_GO_ON;
@@ -321,21 +402,18 @@ REQUEST_FUNC(mod_ddnsto_reset) {
 
 TRIGGER_FUNC(mod_ddnsto_handle_trigger) {
     const plugin_data * const p = p_d;
-    const unix_time64_t cur_ts = log_monotonic_secs + 1;
+    time_t now = time(NULL);
+    now -= CONN_TIMEOUT;
 
     log_error(srv->errh, __FILE__, __LINE__, "ddnsto trigger");
 
-    for (connection *con = srv->conns; con; con = con->next) {
-        request_st * const r = &con->request;
-        handler_conn_ctx *hctx = r->plugin_ctx[p->id];
-        if (NULL == hctx || r->handler_module != p->self)
-            continue;
-
-        if ((hctx->create_ts + 3) < cur_ts) {
-            hctx->create_ts = cur_ts;
-            joblist_append(con);
-            continue;
+    handler_conn_ctx *hctx = NULL;
+    STAILQ_FOREACH(hctx, &p->handler_conn_list, conn_entry) {
+      if (hctx->create_ts < now) {
+        if(NULL != hctx->r->con) {
+          joblist_append(hctx->r->con);
         }
+      }
     }
 
     return HANDLER_GO_ON;
