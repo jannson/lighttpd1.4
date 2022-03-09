@@ -82,6 +82,7 @@ static handler_conn_ctx * mod_ddnsto_handler_ctx_init (plugin_data * const p) {
     handler_conn_ctx *hctx = calloc(1, sizeof(*hctx));
     force_assert(hctx);
     memcpy(&hctx->conf, &p->conf, sizeof(plugin_config));
+    STAILQ_INIT(&p->handler_conn_list);
     return hctx;
 }
 
@@ -233,6 +234,28 @@ static void response_json(request_st *r, const char* resp_str, size_t resp_len) 
     buffer_append_string_len(vb, CONST_STR_LEN("application/json; charset=utf-8"));
 }
 
+static handler_t wait_request_ready(request_st *r, chunkqueue * const cq) {
+    chunkqueue_remove_finished_chunks(cq);
+    while(cq->bytes_in != (off_t) r->reqbody_length) {
+      if(!(r->conf.stream_request_body & FDEVENT_STREAM_REQUEST_POLLIN)) {
+        r->conf.stream_request_body |= FDEVENT_STREAM_REQUEST_POLLIN;
+        r->con->is_readable = 1;
+      }
+
+      handler_t rc = r->con->reqbody_read(r);
+      if(rc != HANDLER_GO_ON) {
+        return rc;
+      }
+
+      if(-1 == r->reqbody_length 
+          && !(r->conf.stream_request_body & FDEVENT_STREAM_REQUEST)) {
+        // wait request finished if it's chunk
+        return HANDLER_WAIT_FOR_EVENT;
+      }
+    }
+    return HANDLER_GO_ON;
+}
+
 #define CMD_OUTPUT_FMT "{\"local_id\",%u, \"remote_id\":%u, \"remote_tag\":\"%s\", \"create_ts\":\"%llu\", \"get_ts\":\"%llu\", \"val\":\"%s\"}"
 
 static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
@@ -248,17 +271,21 @@ static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
     if(0 == hctx->command_ready) {
       // not ready, read request
       chunkqueue * const cq = &r->reqbody_queue;
-      chunkqueue_remove_finished_chunks(cq); /* unnecessary? */
-      if (cq->bytes_in < (off_t)r->reqbody_length) {
-        return HANDLER_WAIT_FOR_EVENT;
+      handler_t hret = wait_request_ready(r, cq);
+      if (HANDLER_GO_ON != hret) {
+        return hret;
       }
 
       buffer *body = chunkqueue_read_squash(cq, r->conf.errh);
       cJSON *json = NULL;
       cJSON *tmp = NULL;
       int ret = 0;
+      const char *body_str = body->ptr + body->used - (uint32_t)r->reqbody_length - 1;
+
+      log_error(r->conf.errh, __FILE__, __LINE__, "chunkqueue is ready, body=%s", body_str);
+
       do {
-        json = cJSON_Parse(body->ptr);
+        json = cJSON_Parse(body_str);
         if(NULL == json) {
           ret = -1;
           break;
@@ -282,7 +309,8 @@ static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
       if (NULL != json) {
         cJSON_Delete(json);
       }
-      chunk_buffer_release(body);
+      // chunk_buffer_release(body);
+      log_error(r->conf.errh, __FILE__, __LINE__, "chunkqueue body finish ret=%d", ret);
       if(0 != ret) {
         http_status_set_error(r, 400);
         return HANDLER_FINISHED;
@@ -411,6 +439,7 @@ TRIGGER_FUNC(mod_ddnsto_handle_trigger) {
     STAILQ_FOREACH(hctx, &p->handler_conn_list, conn_entry) {
       if (hctx->create_ts < now) {
         if(NULL != hctx->r->con) {
+          log_error(srv->errh, __FILE__, __LINE__, "ddnsto append job");
           joblist_append(hctx->r->con);
         }
       }
