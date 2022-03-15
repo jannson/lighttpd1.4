@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sys-time.h"
+#include <unistd.h>
 
 #include "base.h"
 #include "log.h"
@@ -23,62 +24,10 @@
 #include "http_header.h"
 #include "keyvalue.h"
 #include "response.h"
-#include "kvec.h"
-#include "queue.h"
-#include "kstring.h"
-#include "cJSON.h"
 
-#include "plugin.h"
+#include "mod_ddnsto.h"
 
-#define CONN_TIMEOUT    (30)
-#define COMMAND_TIMEOUT (20)
-#define COMMAND_TAG_LEN (32)
-#define COMMAND_DEF     (50)
-#define COMMAND_MAX     (200)
-typedef struct command {
-  uint32_t        local_id;
-  uint32_t        remote_id;
-  char            remote_tag[COMMAND_TAG_LEN];
-  time_t          create_ts;
-  kstring_t       val;
-} command_t;
-
-typedef struct command* command_item;
-typedef kvec_t(command_item) command_array;
-
-typedef struct {
-  /* not used */
-	char json;
-  uint32_t local_id_start;
-} plugin_config;
-
-typedef struct handler_conn {
-	plugin_config conf;
-
-  STAILQ_ENTRY(handler_conn) conn_entry;
-
-  int      command_ready;
-  uint32_t command_from;
-  uint32_t command_size;
-  int      conn_add;
-  time_t   create_ts;
-
-  request_st* r;
-} handler_conn_ctx;
-
-STAILQ_HEAD(handler_conn_list_head, handler_conn);
-
-typedef struct {
-	PLUGIN_DATA;
-	plugin_config defaults;
-	plugin_config conf;
-	int processing;
-
-  struct handler_conn_list_head handler_conn_list;
-  command_array commands;
-} plugin_data;
-
-static handler_conn_ctx * mod_ddnsto_handler_ctx_init (plugin_data * const p) {
+handler_conn_ctx * mod_ddnsto_handler_ctx_init (plugin_data * const p) {
     handler_conn_ctx *hctx = calloc(1, sizeof(*hctx));
     force_assert(hctx);
     memcpy(&hctx->conf, &p->conf, sizeof(plugin_config));
@@ -90,6 +39,11 @@ static void mod_ddnsto_handler_ctx_free(plugin_data * const p, handler_conn_ctx 
     if(hctx->conn_add) {
       STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
       hctx->conn_add = 0;
+    }
+    if(-1 != hctx->fd) {
+      fdevent_fdnode_event_del(hctx->ev, hctx->fdn);
+      fdevent_sched_close(hctx->ev, hctx->fd, 0);
+      hctx->fdn = NULL;
     }
     free(hctx);
 }
@@ -182,6 +136,7 @@ URIHANDLER_FUNC(mod_ddnsto_handle_uri_clean) {
 
     if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wait/"))
           || buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wake/"))
+          || buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/wol/"))
         ) {
         r->handler_module = p->self;
         r->resp_body_started = 1;
@@ -222,7 +177,7 @@ static void remove_timeout_commands(plugin_data * const p, time_t now) {
     }
 }
 
-static void response_json(request_st *r, const char* resp_str, size_t resp_len) {
+void ddnsto_response_json(request_st *r, const char* resp_str, size_t resp_len) {
     chunkqueue * const cq = &r->write_queue;
     buffer * const out = chunkqueue_append_buffer_open(cq);
     buffer_append_string_len(out, resp_str, resp_len);
@@ -234,7 +189,7 @@ static void response_json(request_st *r, const char* resp_str, size_t resp_len) 
     buffer_append_string_len(vb, CONST_STR_LEN("application/json; charset=utf-8"));
 }
 
-static handler_t wait_request_ready(request_st *r, chunkqueue * const cq) {
+handler_t wait_request_ready(request_st *r, chunkqueue * const cq) {
     chunkqueue_remove_finished_chunks(cq);
     while(cq->bytes_in != (off_t) r->reqbody_length) {
       if(!(r->conf.stream_request_body & FDEVENT_STREAM_REQUEST_POLLIN)) {
@@ -258,8 +213,7 @@ static handler_t wait_request_ready(request_st *r, chunkqueue * const cq) {
 
 #define CMD_OUTPUT_FMT "{\"local_id\",%u, \"remote_id\":%u, \"remote_tag\":\"%s\", \"create_ts\":\"%llu\", \"get_ts\":\"%llu\", \"val\":\"%s\"}"
 
-static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
-    plugin_data * const p = p_d;
+static handler_t handle_ddnsto_wait(request_st *r, plugin_data * const p) {
     time_t now = time(NULL);
     // create handler_conn_ctx per connection
     handler_conn_ctx * hctx = r->plugin_ctx[p->id];
@@ -354,7 +308,7 @@ static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
         STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
         hctx->conn_add = 0;
       }
-      response_json(r, ks_str(&output), ks_len(&output));
+      ddnsto_response_json(r, ks_str(&output), ks_len(&output));
       r->resp_body_finished = 1; 
       ks_free(&output);
       return HANDLER_FINISHED;
@@ -367,7 +321,7 @@ static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
         STAILQ_REMOVE(&p->handler_conn_list, hctx, handler_conn, conn_entry);
         hctx->conn_add = 0;
       }
-      response_json(r, CONST_STR_LEN("{\"success\":-1001,\"error\":\"timeout\"}"));
+      ddnsto_response_json(r, CONST_STR_LEN("{\"success\":-1001,\"error\":\"timeout\"}"));
       r->resp_body_finished = 1; 
       return HANDLER_FINISHED;
     }
@@ -382,9 +336,11 @@ static handler_t handle_ddnsto_wait(request_st *r, void *p_d) {
     return HANDLER_WAIT_FOR_EVENT;
 }
 
-static handler_t handle_ddnsto_wake(request_st *r, void *p_d) {
+static handler_t handle_ddnsto_wake(request_st *r, plugin_data * const p) {
     return HANDLER_FINISHED;
 }
+
+handler_t handle_ddnsto_wol(request_st *r, plugin_data * const p);
 
 SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
     plugin_data * const p = p_d;
@@ -394,9 +350,11 @@ SUBREQUEST_FUNC(mod_ddnsto_subrequest) {
     }
 
     if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wait/"))) {
-        return handle_ddnsto_wait(r, p_d);
+        return handle_ddnsto_wait(r, p);
     } else if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/ddnsto/wake/"))) {
-        return handle_ddnsto_wake(r, p_d);
+        return handle_ddnsto_wake(r, p);
+    } else if (buffer_eq_slen(&r->uri.path, CONST_STR_LEN("/api/wol/"))) {
+        return handle_ddnsto_wol(r, p);
     } else {
       /* send error here */
         chunkqueue * const cq = &r->write_queue;
@@ -452,6 +410,8 @@ FREE_FUNC(mod_ddnsto_free) {
     plugin_data * const p = p_d;
     kv_destroy(p->commands);
 }
+
+
 
 int mod_ddnsto_plugin_init(plugin *p);
 int mod_ddnsto_plugin_init(plugin *p) {
