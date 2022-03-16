@@ -30,6 +30,7 @@
 #include <fdevent.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
 
 #include "mod_ddnsto.h"
 
@@ -57,10 +58,33 @@ static handler_t wol_process_rd_revents(handler_conn_ctx * const hctx, request_s
   ssize_t n;
   unsigned char buf[bufsize];
 
+  // TODO read to end
   n = read(fd, buf, bufsize);
+  if (n < 0) {
+    switch (errno) {
+      case EAGAIN:
+     #ifdef EWOULDBLOCK
+     #if EWOULDBLOCK != EAGAIN
+      case EWOULDBLOCK:
+     #endif
+     #endif
+      case EINTR:
+        return HANDLER_GO_ON;
+      default:
+        r->resp_body_finished = 1;
+        r->http_status = 500;
+
+        log_perror(r->conf.errh, __FILE__, __LINE__,
+          "read() %d %d", r->con->fd, fd);
+
+        return HANDLER_ERROR;
+    }
+  }
+
   log_error(r->conf.errh, __FILE__, __LINE__,
-    "wol rd n=%ld", n);
+    "wol rd n=%ld buf=%s\n", n, (char*)buf);
   hctx->fd_read_ok = 1;
+
   return HANDLER_GO_ON;
 }
 
@@ -94,12 +118,16 @@ handler_t handle_ddnsto_wol(request_st *r, plugin_data * const p) {
   if (rd_revents) {
     hctx->rd_revents = 0;
     handler_t rc = wol_process_rd_revents(hctx, r, rd_revents);
-    if (rc != HANDLER_GO_ON) return rc; /*(might invalidate hctx)*/
+    if (rc != HANDLER_GO_ON) {
+      return rc;
+    }
   }
   if (wr_revents) {
     hctx->wr_revents = 0;
     handler_t rc = wol_process_wr_revents(hctx, r, wr_revents);
-    if (rc != HANDLER_GO_ON) return rc; /*(might invalidate hctx)*/
+    if (rc != HANDLER_GO_ON) {
+      return rc;
+    }
   }
 
   if(0 == hctx->command_ready) {
@@ -125,17 +153,18 @@ handler_t handle_ddnsto_wol(request_st *r, plugin_data * const p) {
         child(fd[childsocket]);
         exit(0);
     } else { 
-        log_error(r->conf.errh, __FILE__, __LINE__, "wol fork");
-
         /* you are the parent */
         close(fd[childsocket]); /* Close the child file descriptor */
         hctx->fd = fd[parentsocket];
         hctx->fdn = fdevent_register(hctx->ev, hctx->fd, wol_handle_fdevent, hctx);
         if (-1 == fdevent_fcntl_set_nb(hctx->fd)) {
           log_perror(r->conf.errh, __FILE__, __LINE__, "fcntl failed");
-          // TODO
-          return HANDLER_FINISHED;
+          r->resp_body_finished = 1;
+          r->http_status = 500;
+          return HANDLER_ERROR;
         }
+
+			  //fdevent_fdnode_event_set(hctx->ev, hctx->fdn, FDEVENT_OUT);
 		    fdevent_fdnode_event_set(hctx->ev, hctx->fdn, FDEVENT_IN | FDEVENT_RDHUP);
     }
   }
@@ -148,5 +177,4 @@ handler_t handle_ddnsto_wol(request_st *r, plugin_data * const p) {
 
   return HANDLER_WAIT_FOR_EVENT;
 }
-
 
